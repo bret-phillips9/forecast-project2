@@ -1,0 +1,234 @@
+---
+title: "forecast-project2"
+author: "Bret Phillips"
+date: "2025-03-30"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+## Load Required Libraries
+
+```{r}
+library(lubridate)
+library(dplyr)
+library(ggplot2)
+library(keras)
+library(tfruns)
+```
+
+## Import Data
+
+```{r}
+time_raw <- read.csv("./data/dataset_for_technical_assessment.csv")
+summary(time_raw)
+```
+
+# Data Cleaning and Preprocessing
+
+The initial steps are similar to forecast-project1.  See that repo for more information.
+
+## Initial Cleaning and Preprocessing
+
+One difference between this project and the previous attempt using ARIMA is that here we split the data into 3 datasets: testing, validation, and test.  The test data will be the final 2 weeks of data, same as before.  The validation data will be a 10% sample of the data.  The remaining data will be the training data.
+
+```{r}
+time_clean <- time_raw |> 
+     # delete missing y's, impute missing x's
+     filter(!is.na(y1)) |> 
+     filter(!is.na(y2)) |> 
+     mutate(x1 = ifelse(is.na(x1), mean(x1, na.rm = TRUE), x1)) |> 
+     mutate(x2 = ifelse(is.na(x2), mean(x2, na.rm = TRUE), x2)) |> 
+     mutate(x3 = ifelse(is.na(x3), mean(x3, na.rm = TRUE), x3)) |> 
+     mutate(x4 = ifelse(is.na(x4), mean(x4, na.rm = TRUE), x4)) |> 
+     mutate(x5 = ifelse(is.na(x5), mean(x5, na.rm = TRUE), x5)) |> 
+     mutate(x6 = ifelse(is.na(x6), mean(x6, na.rm = TRUE), x6)) |> 
+     mutate(x7 = ifelse(is.na(x7), mean(x7, na.rm = TRUE), x7)) |> 
+     mutate(x8 = ifelse(is.na(x8), mean(x8, na.rm = TRUE), x8)) |> 
+     as.data.frame()  
+     
+summary(time_clean)
+
+# time intelligence
+time_clean <- time_clean |> 
+     mutate(timestamp = ymd_hms(Description)) |> 
+     mutate(day = ymd(substr(Description, start = 1, stop=10))) |> 
+     mutate(hour = paste("2016-09-30 ", format(timestamp, "%H:%M:%S"))) |> 
+     mutate(from_start = timestamp - timestamp[1]) |> 
+     select(-Description)
+
+summary(time_clean$timestamp)
+
+# create joint target variable and new regressors
+time_clean <- time_clean |> 
+     mutate(y_joint = y1 + y2) |> 
+     mutate(y1_zero = ifelse(y1 == 0, 1, 0)) |> 
+     mutate(y2_zero = ifelse(y2 == 0, 1, 0))
+
+# testing-validation-test split
+n_obs <- nrow(time_clean)
+sample_size_val <- floor(.1 * n_obs)
+
+time_test <- tail(time_clean, n = 4032)
+
+time_other <- setdiff(time_clean, time_test)
+
+time_val <- tail(time_other, n = sample_size_val)
+time_train <- setdiff(time_other, time_val)
+
+ggplot()+
+     geom_point(data = time_train, aes(x = timestamp, y = y_joint), col="red")+
+     geom_point(data = time_val, aes(x = timestamp, y = y_joint), col="green")+
+     geom_point(data = time_test, aes(x = timestamp, y = y_joint), col="blue")+
+     ggtitle("Train (red), Val (green), & Test (blue) Split")
+```
+
+## Reshape Data
+
+LSTM requires data to be in array form.
+
+```{r}
+n_timesteps <- 200 # this is the number of obs you want to predict ahead
+                   # of the current obs - like a context window
+n_features <- 8
+
+lstm_reshape <- function(features, target, n_timesteps, n_features) {
+  n_obs <- length(target) - 2 * n_timesteps
+  # initialize arrays
+  x_arr <- array(NA, dim = c(n_obs, n_timesteps, n_features))
+  y_arr <- array(NA, dim = c(n_obs, n_timesteps, 1))
+  
+  for (i in 1:n_obs) {
+    for (j in 1:n_features){
+         x_arr[i, 1:n_timesteps, j] <- features[i:(i + n_timesteps - 1), j]
+    }
+    y_arr[i, 1:n_timesteps, 1] <- target[(i + n_timesteps):(i + 2*n_timesteps - 1)]
+  }
+  
+  list(x_arr, y_arr)
+}
+```
+
+The independent X and dependent y variables are separated.
+
+```{r}
+c(x_train, y_train) %<-% lstm_reshape(features = time_train[, c(3:10,16:17)], 
+                                                 target = time_train$y_joint,
+                                                 n_timesteps = n_timesteps,
+                                                 n_features = n_features)
+
+c(x_val, y_val) %<-% lstm_reshape(features = time_val[, c(3:10,16:17)], 
+                                             target = time_val$y_joint,
+                                             n_timesteps = n_timesteps,
+                                             n_features = n_features)
+
+c(x_test, y_test) %<-% lstm_reshape(features = time_test[, c(3:10,16:17)], 
+                                               target = time_test$y_joint,
+                                               n_timesteps = n_timesteps,
+                                               n_features = n_features)
+
+
+```
+
+
+# Modeling
+
+We define flags, that can be used later to specify parameters of the model.
+
+```{r parameters}
+FLAGS <- tfruns::flags(
+  flag_integer("batch_size", 10),
+  flag_integer("n_epochs", 100), 
+  flag_string("loss", "mean_absolute_error"),
+  flag_string("optimizer_type", "adam"),
+  flag_integer("n_units", 128)  # LSTM layer size
+ )
+```
+
+The function for creating the model is created.
+
+```{r}
+create_model <- function(){
+  keras_model_sequential() |> 
+    layer_lstm(units = FLAGS$n_units,
+               return_sequences = TRUE,
+               input_shape = c(n_timesteps, n_features)) |> 
+    layer_dense(units = 1) |> 
+    compile(loss = FLAGS$loss,
+            optimizer = FLAGS$optimizer_type,
+            metrics = "mean_absolute_error")
+}
+
+
+```
+
+## Y_joint LSTM Modeling
+
+We create the model and fit it to the data.
+
+```{r}
+lstm_model <- create_model()
+
+start <- Sys.time()
+
+y_history <- lstm_model |> 
+  fit(x = x_train,
+      y = y_train,
+      verbose = 0,
+      validation_data = list(x_val, y_val),
+      batch_size = FLAGS$batch_size,
+      epochs = FLAGS$n_epochs)
+
+elapsed <- Sys.time() - start
+print("Training time:")
+elapsed
+
+```
+The model took 15 hours to train on a laptop.
+
+### Model Evaluation
+
+For the evaluation, we use our test data.
+
+```{r}
+y_pred <- lstm_model %>% 
+  predict(x_test)
+```
+
+Finally, we check the performance visually. We create a plot for specific point in time.
+
+```{r}
+start_point <- 500 # pick any obs to start from
+predicted_series <- tibble(timestamp = time_test$timestamp[start_point: (start_point+n_timesteps-1)], 
+                           y_joint = y_pred[start_point,1:n_timesteps,1])
+
+ggplot(time_test, aes(timestamp, y_joint)) + 
+  geom_point(alpha = .1) +
+  geom_point(data = time_test[(start_point-n_timesteps):(start_point-1), ], col = "blue") +
+  geom_point(data = predicted_series, col = "red")
+```
+
+- Black points represent the overall test data.
+
+- Blue points represent the points used for prediction.
+
+- Red points indicate the predicted values.
+
+The predictions are pretty good during the middle of the forecast period, less so toward the ends.  An extreme outlier seems to be skewing the predictions a bit.
+
+# Conclusion
+
+Again, domain knowledge would go a long way towards understanding what these results mean.
+
+It doesn't seem as though LSTM is an improvement over ARIMA in this case.
+
+A possible next step might be to explore interactions of the features with the y1_zero and y2_zero factors, to get more precise estimates of how different regressors become more or less important during different periods of time.
